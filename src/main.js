@@ -14,6 +14,67 @@ import { createTopBar }            from './ui/topbar.js';
 
 const CSS = '__SKIN_CSS__';
 
+(function installPlaybackRetry() {
+  const PLAYBACK_RE = /\/api\/v2\/channels\/[^/]+\/playback-url\/?(?:\?|$)/;
+  const DELAYS = [100, 400];
+  let _cachedResponse = null;
+
+  function isTarget(args) {
+    const url = typeof args[0] === 'string' ? args[0]
+      : args[0] instanceof URL ? args[0].href
+      : args[0]?.url ?? '';
+    const method = String(args[1]?.method ?? args[0]?.method ?? 'GET').toUpperCase();
+    return method === 'GET' && PLAYBACK_RE.test(url);
+  }
+
+  function isRetryable(status) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(signal.reason); return; }
+      const id = setTimeout(resolve, ms);
+      signal?.addEventListener('abort', () => { clearTimeout(id); reject(signal.reason); }, { once: true });
+    });
+  }
+
+  const _orig = window.fetch;
+  window.fetch = async function (...args) {
+    if (!isTarget(args)) return _orig.apply(this, args);
+
+    const [input, init = {}] = args;
+    const signal = init?.signal ?? input?.signal;
+    const safeArgs = [input, { ...init, credentials: 'omit' }];
+
+    for (let i = 0; ; i++) {
+      try {
+        const res = await _orig.apply(this, safeArgs);
+        if (i >= DELAYS.length || signal?.aborted || !isRetryable(res.status)) {
+          // Cache a clone on success so we can serve it if the server flakes later
+          res.clone().text().then(body => {
+            _cachedResponse = { body, status: res.status, headers: Object.fromEntries(res.headers) };
+          }).catch(() => {});
+          return res;
+        }
+      } catch (err) {
+        if (signal?.aborted || err?.name === 'AbortError') throw err;
+        // CORS block or network failure — serve cache if we have it
+        if (_cachedResponse) {
+          console.warn('[KickTiny] playback-url blocked, serving cached response');
+          return new Response(_cachedResponse.body, {
+            status: _cachedResponse.status,
+            headers: _cachedResponse.headers,
+          });
+        }
+        if (i >= DELAYS.length) throw err;
+        console.warn('[KickTiny] playback-url failed, retrying in', DELAYS[i], 'ms');
+      }
+      await sleep(DELAYS[i], signal);
+    }
+  };
+})();
+
 function injectStyles(css) {
   const style = document.createElement('style');
   style.id = 'kt-styles'; style.textContent = css;
